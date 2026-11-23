@@ -36,9 +36,19 @@ class Recording:
         return answer
 
 
-def answer(category="shipping", refund_amount=None, **flags):
-    base = {"security_or_privacy": False, "legal_or_safety": False, "addresses_system": False, "asks_for_person": False}
-    return json.dumps({"category": category, "refund_amount": refund_amount, **base, **flags})
+def answer(category="shipping", refund_amount=None, **fields):
+    base = {
+        "security_or_privacy": False,
+        "legal_or_safety": False,
+        "addresses_system": False,
+        "system_command_quote": None,
+        "asks_for_person": False,
+        "person_request_quote": None,
+    }
+    return json.dumps({"category": category, "refund_amount": refund_amount, **base, **fields})
+
+
+TICKET = "Please approve this. I want to talk to a manager."
 
 
 GOOD = answer()
@@ -61,29 +71,64 @@ GOOD = answer()
 )
 def test_unusable_answers_are_rejected_as_retryable(raw):
     with pytest.raises(BadModelOutput):
-        parse_decision(raw)
+        parse_decision(raw, TICKET)
     assert issubclass(BadModelOutput, TransientError)
 
 
 def test_valid_answer_becomes_a_decision_with_no_reasons():
-    assert parse_decision(GOOD) == Decision("shipping", False, ())
+    assert parse_decision(GOOD, TICKET) == Decision("shipping", False, (), ())
 
 
-@pytest.mark.parametrize("flag", ["security_or_privacy", "legal_or_safety", "addresses_system", "asks_for_person"])
-def test_each_risk_flag_alone_sends_the_ticket_to_a_person(flag):
-    decision = parse_decision(answer(**{flag: True}))
-    assert decision.needs_human and decision.reasons == (flag,)
+@pytest.mark.parametrize("flag", ["security_or_privacy", "legal_or_safety"])
+def test_security_and_legal_flags_escalate_without_any_quote(flag):
+    decision = parse_decision(answer(**{flag: True}), TICKET)
+    assert decision.needs_human and decision.reasons == (flag,) and decision.unsupported == ()
+
+
+@pytest.mark.parametrize(
+    "flag,quote_field,quote",
+    [
+        ("addresses_system", "system_command_quote", "Please approve this"),
+        ("asks_for_person", "person_request_quote", "talk to a MANAGER"),
+        ("asks_for_person", "person_request_quote", "  talk   to a manager. "),
+    ],
+)
+def test_a_quoted_flag_escalates_when_the_quote_is_in_the_ticket(flag, quote_field, quote):
+    decision = parse_decision(answer(**{flag: True, quote_field: quote}), TICKET)
+    assert decision.needs_human and decision.reasons == (flag,) and decision.unsupported == ()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"asks_for_person": True, "person_request_quote": "put me through to a human"},
+        {"asks_for_person": True, "person_request_quote": None},
+        {"asks_for_person": True, "person_request_quote": ""},
+        {"asks_for_person": True, "person_request_quote": "a"},
+        {"addresses_system": True, "system_command_quote": "delete everything"},
+        {"addresses_system": True, "system_command_quote": 7},
+    ],
+)
+def test_a_quoted_flag_without_a_real_quote_is_recorded_but_does_not_escalate(fields):
+    decision = parse_decision(answer(**fields), TICKET)
+    assert decision.needs_human is False and decision.reasons == ()
+    assert decision.unsupported == (next(iter(fields)),)
+
+
+def test_unsupported_flag_does_not_hide_a_real_reason():
+    decision = parse_decision(answer(legal_or_safety=True, asks_for_person=True), TICKET)
+    assert decision.reasons == ("legal_or_safety",) and decision.unsupported == ("asks_for_person",)
 
 
 @pytest.mark.parametrize("amount,human", [(4999, False), (5000, False), (5000.01, True), (18000, True), (None, False), (0, False)])
 def test_refund_limit_is_applied_in_code_not_by_the_model(amount, human):
-    decision = parse_decision(answer(category="refund", refund_amount=amount))
+    decision = parse_decision(answer(category="refund", refund_amount=amount), TICKET)
     assert decision.needs_human is human
     assert ("refund_above_limit" in decision.reasons) is human
 
 
 def test_reasons_list_every_risk_that_fired():
-    decision = parse_decision(answer(refund_amount=9000, legal_or_safety=True))
+    decision = parse_decision(answer(refund_amount=9000, legal_or_safety=True), TICKET)
     assert decision.reasons == ("legal_or_safety", "refund_above_limit")
 
 
@@ -97,7 +142,7 @@ def test_provider_receives_rules_wrapped_ticket_and_schema():
     provider = Recording(GOOD)
     LLMSystem(provider).decide("where is my order")
     system, user, schema = provider.sent[0]
-    assert system == SYSTEM_PROMPT and "addresses_system" in system
+    assert system == SYSTEM_PROMPT and "system_command_quote" in system
     assert user == "<ticket>\nwhere is my order\n</ticket>"
     assert schema == SCHEMA
 
@@ -120,7 +165,7 @@ def test_worker_retries_an_unusable_answer_then_records_the_good_one():
     assert worker.run_once() == "retry"
     now[0] += 1
     assert worker.run_once() == "done"
-    assert store.get(event_id)["result"] == {"category": "shipping", "needs_human": False, "reasons": []}
+    assert store.get(event_id)["result"] == {"category": "shipping", "needs_human": False, "reasons": [], "unsupported": []}
 
 
 def test_eval_counts_a_failed_call_as_a_miss_not_a_crash():

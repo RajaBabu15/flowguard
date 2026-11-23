@@ -61,7 +61,7 @@ def test_event_is_processed_once_and_the_audit_trail_shows_it(store, clock):
     assert worker.run_once() is None
     event = store.get(event_id)
     assert event["status"] == "done" and event["attempts"] == 1
-    assert event["result"] == {"category": "shipping", "needs_human": False, "reasons": []}
+    assert event["result"] == {"category": "shipping", "needs_human": False, "reasons": [], "unsupported": []}
     assert kinds(store, event_id) == ["accepted", "claimed", "done"]
 
 
@@ -144,8 +144,8 @@ def test_a_slow_worker_cannot_overwrite_the_worker_that_took_over(store, clock):
     second = store.claim(clock(), 30, 3)
     assert second.event_id == first.event_id and second.attempt == 2
     with pytest.raises(LeaseLost):
-        store.complete(event_id, first.attempt, "done", {"category": "other", "needs_human": False, "reasons": []}, clock())
-    winner = {"category": "shipping", "needs_human": False, "reasons": []}
+        store.complete(event_id, first.attempt, "done", {"category": "other", "needs_human": False, "reasons": [], "unsupported": []}, clock())
+    winner = {"category": "shipping", "needs_human": False, "reasons": [], "unsupported": []}
     store.complete(event_id, second.attempt, "done", winner, clock())
     assert store.get(event_id)["result"] == winner
 

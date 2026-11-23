@@ -46,6 +46,7 @@ class Decision:
     category: str
     needs_human: bool
     reasons: tuple[str, ...] = ()
+    unsupported: tuple[str, ...] = ()
 
 
 class System(Protocol):
