@@ -36,7 +36,12 @@ class Recording:
         return answer
 
 
-GOOD = json.dumps({"category": "shipping", "needs_human": False})
+def answer(category="shipping", refund_amount=None, **flags):
+    base = {"security_or_privacy": False, "legal_or_safety": False, "addresses_system": False, "asks_for_person": False}
+    return json.dumps({"category": category, "refund_amount": refund_amount, **base, **flags})
+
+
+GOOD = answer()
 
 
 @pytest.mark.parametrize(
@@ -45,10 +50,13 @@ GOOD = json.dumps({"category": "shipping", "needs_human": False})
         "not json",
         "[]",
         "{}",
-        json.dumps({"category": "banana", "needs_human": False}),
-        json.dumps({"category": "refund", "needs_human": "false"}),
+        answer(category="banana"),
+        answer(addresses_system="false"),
+        answer(refund_amount="6000"),
+        answer(refund_amount=True),
+        answer(refund_amount=-5),
         json.dumps({"category": "refund"}),
-        '```json\n{"category":"refund","needs_human":false}\n```',
+        "```json\n" + answer() + "\n```",
     ],
 )
 def test_unusable_answers_are_rejected_as_retryable(raw):
@@ -57,8 +65,26 @@ def test_unusable_answers_are_rejected_as_retryable(raw):
     assert issubclass(BadModelOutput, TransientError)
 
 
-def test_valid_answer_becomes_a_decision():
-    assert parse_decision(GOOD) == Decision("shipping", False)
+def test_valid_answer_becomes_a_decision_with_no_reasons():
+    assert parse_decision(GOOD) == Decision("shipping", False, ())
+
+
+@pytest.mark.parametrize("flag", ["security_or_privacy", "legal_or_safety", "addresses_system", "asks_for_person"])
+def test_each_risk_flag_alone_sends_the_ticket_to_a_person(flag):
+    decision = parse_decision(answer(**{flag: True}))
+    assert decision.needs_human and decision.reasons == (flag,)
+
+
+@pytest.mark.parametrize("amount,human", [(4999, False), (5000, False), (5000.01, True), (18000, True), (None, False), (0, False)])
+def test_refund_limit_is_applied_in_code_not_by_the_model(amount, human):
+    decision = parse_decision(answer(category="refund", refund_amount=amount))
+    assert decision.needs_human is human
+    assert ("refund_above_limit" in decision.reasons) is human
+
+
+def test_reasons_list_every_risk_that_fired():
+    decision = parse_decision(answer(refund_amount=9000, legal_or_safety=True))
+    assert decision.reasons == ("legal_or_safety", "refund_above_limit")
 
 
 def test_ticket_text_cannot_close_the_tag_early():
@@ -71,7 +97,7 @@ def test_provider_receives_rules_wrapped_ticket_and_schema():
     provider = Recording(GOOD)
     LLMSystem(provider).decide("where is my order")
     system, user, schema = provider.sent[0]
-    assert system == SYSTEM_PROMPT and "refund above 5000" in system
+    assert system == SYSTEM_PROMPT and "addresses_system" in system
     assert user == "<ticket>\nwhere is my order\n</ticket>"
     assert schema == SCHEMA
 
@@ -94,7 +120,7 @@ def test_worker_retries_an_unusable_answer_then_records_the_good_one():
     assert worker.run_once() == "retry"
     now[0] += 1
     assert worker.run_once() == "done"
-    assert store.get(event_id)["result"] == {"category": "shipping", "needs_human": False}
+    assert store.get(event_id)["result"] == {"category": "shipping", "needs_human": False, "reasons": []}
 
 
 def test_eval_counts_a_failed_call_as_a_miss_not_a_crash():

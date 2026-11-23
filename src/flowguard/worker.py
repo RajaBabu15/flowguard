@@ -58,7 +58,7 @@ class Worker:
             claim.event_id,
             claim.attempt,
             status,
-            {"category": decision.category, "needs_human": decision.needs_human},
+            {"category": decision.category, "needs_human": decision.needs_human, "reasons": list(decision.reasons)},
             self.clock(),
         )
         return status

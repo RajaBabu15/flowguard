@@ -45,6 +45,7 @@ class Case:
 class Decision:
     category: str
     needs_human: bool
+    reasons: tuple[str, ...] = ()
 
 
 class System(Protocol):
@@ -61,6 +62,7 @@ class Report:
     stability: float
     disputed_accuracy: float | None = None
     missed_escalations: list[str] = field(default_factory=list)
+    false_escalations: list[str] = field(default_factory=list)
     wrong_categories: list[str] = field(default_factory=list)
     wrong_disputed: list[str] = field(default_factory=list)
     failed_calls: list[str] = field(default_factory=list)
@@ -111,7 +113,7 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
     runs = [[decide(c) for c in cases] for _ in range(repeats)]
 
     correct = counted = d_correct = d_counted = tp = fp = fn = 0
-    wrong_categories, wrong_disputed, missed = set(), set(), set()
+    wrong_categories, wrong_disputed, missed, false_alarms = set(), set(), set(), set()
     tag_hits: dict[str, list[int]] = defaultdict(list)
     for run in runs:
         for case, got in zip(cases, run):
@@ -136,6 +138,7 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
                 missed.add(case.id)
             elif flagged:
                 fp += 1
+                false_alarms.add(case.id)
 
     if counted == 0:
         raise ValueError("every case is disputed; the headline accuracy would be empty")
@@ -152,6 +155,7 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
         escalation_precision=precision,
         stability=stable / len(cases),
         missed_escalations=sorted(missed),
+        false_escalations=sorted(false_alarms),
         wrong_categories=sorted(wrong_categories),
         wrong_disputed=sorted(wrong_disputed),
         failed_calls=sorted(failed),
@@ -179,6 +183,7 @@ def format_report(report: Report) -> str:
         f"escalation precision {report.escalation_precision:.3f}",
         f"stability            {report.stability:.3f}",
         f"missed escalations   {', '.join(report.missed_escalations) or 'none'}",
+        f"false escalations   {', '.join(report.false_escalations) or 'none'}",
         f"failed calls         {', '.join(report.failed_calls) or 'none'}",
         f"wrong categories     {', '.join(report.wrong_categories) or 'none'}",
         "disputed accuracy    "

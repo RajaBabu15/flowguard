@@ -61,7 +61,7 @@ def test_event_is_processed_once_and_the_audit_trail_shows_it(store, clock):
     assert worker.run_once() is None
     event = store.get(event_id)
     assert event["status"] == "done" and event["attempts"] == 1
-    assert event["result"] == {"category": "shipping", "needs_human": False}
+    assert event["result"] == {"category": "shipping", "needs_human": False, "reasons": []}
     assert kinds(store, event_id) == ["accepted", "claimed", "done"]
 
 
