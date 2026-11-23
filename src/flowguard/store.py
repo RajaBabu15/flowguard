@@ -11,6 +11,8 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from flowguard.evals import CATEGORIES
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     idempotency_key TEXT PRIMARY KEY,
@@ -31,10 +33,25 @@ CREATE TABLE IF NOT EXISTS audit (
     kind     TEXT NOT NULL,
     detail   TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS reviews (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    at              REAL NOT NULL,
+    reviewer        TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    category_before TEXT NOT NULL,
+    category_after  TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    UNIQUE (event_id, version)
+);
 """
 
 # pending -> processing -> done | needs_human | dead.  A retry sends processing back to pending.
-STATUSES = ("pending", "processing", "done", "needs_human", "dead")
+# A person can later move needs_human to resolved. The model's decision itself is never rewritten.
+STATUSES = ("pending", "processing", "done", "needs_human", "resolved", "dead")
+REVIEW_ACTIONS = ("accept", "correct", "resolve")
+REVIEWABLE = ("done", "needs_human", "resolved")
 
 
 class KeyReusedWithDifferentPayload(Exception):
@@ -43,6 +60,18 @@ class KeyReusedWithDifferentPayload(Exception):
 
 class LeaseLost(Exception):
     """The caller no longer owns this event: another worker claimed it after the lease expired."""
+
+
+class UnknownEvent(KeyError):
+    """No event has this id."""
+
+
+class NotReviewable(Exception):
+    """The event is not in a state where this review makes sense, for example it is still being processed."""
+
+
+class InvalidReview(ValueError):
+    """The review itself is malformed: empty reviewer or reason, unknown action, or a pointless correction."""
 
 
 @dataclass(frozen=True)
@@ -56,6 +85,25 @@ class Claim:
     event_id: str
     payload: dict
     attempt: int
+
+
+def effective_decision(original: dict, reviews: list[dict]) -> dict:
+    """The decision a person reading the ticket should see: the model's, plus any category corrections.
+
+    This is the only place that combines them, and it never touches needs_human or reasons: a correction
+    changes the category and cannot hide a mandatory escalation. Resolving is recorded separately.
+    """
+    category = original["category"]
+    for review in reviews:
+        if review["action"] == "correct":
+            category = review["category_after"]
+    return {
+        "category": category,
+        "needs_human": original["needs_human"],
+        "reasons": original.get("reasons", []),
+        "resolved": any(r["action"] == "resolve" for r in reviews),
+        "version": 1 + len(reviews),
+    }
 
 
 def _hash(payload: dict) -> str:
@@ -160,24 +208,80 @@ class EventStore:
             self._db.commit()
             return status
 
-    def get(self, event_id: str) -> dict | None:
-        with self._lock:
-            row = self._db.execute(
-                "SELECT status, attempts, result, last_error FROM events WHERE event_id = ?", (event_id,)
-            ).fetchone()
-            if row is None:
-                return None
-            trail = self._db.execute(
-                "SELECT at, kind, detail FROM audit WHERE event_id = ? ORDER BY id", (event_id,)
-            ).fetchall()
+    def _reviews(self, event_id: str) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT version, at, reviewer, action, category_before, category_after, reason "
+            "FROM reviews WHERE event_id = ? ORDER BY version",
+            (event_id,),
+        ).fetchall()
+        keys = ("version", "at", "reviewer", "action", "category_before", "category_after", "reason")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def _get_locked(self, event_id: str) -> dict | None:
+        row = self._db.execute(
+            "SELECT status, attempts, result, last_error FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        trail = self._db.execute(
+            "SELECT at, kind, detail FROM audit WHERE event_id = ? ORDER BY id", (event_id,)
+        ).fetchall()
+        original = json.loads(row[2]) if row[2] else None
+        reviews = self._reviews(event_id)
         return {
             "event_id": event_id,
             "status": row[0],
             "attempts": row[1],
-            "result": json.loads(row[2]) if row[2] else None,
+            "result": original,
+            "decision": effective_decision(original, reviews) if original else None,
+            "reviews": reviews,
             "last_error": row[3],
             "audit": [{"at": at, "kind": kind, "detail": detail} for at, kind, detail in trail],
         }
+
+    def get(self, event_id: str) -> dict | None:
+        with self._lock:
+            return self._get_locked(event_id)
+
+    def review(self, event_id: str, reviewer: str, action: str, reason: str, now: float, category: str | None = None) -> dict:
+        """Record a person's review. accept notes agreement, correct changes the category, resolve closes an escalation."""
+        if action not in REVIEW_ACTIONS:
+            raise InvalidReview(f"action must be one of {REVIEW_ACTIONS}")
+        if not reviewer.strip() or not reason.strip():
+            raise InvalidReview("reviewer and reason are required")
+        if action == "correct" and category not in CATEGORIES:
+            raise InvalidReview(f"correct needs a category from {CATEGORIES}")
+        if action != "correct" and category is not None:
+            raise InvalidReview("only a correction takes a category")
+        with self._lock:
+            row = self._db.execute("SELECT status, result FROM events WHERE event_id = ?", (event_id,)).fetchone()
+            if row is None:
+                raise UnknownEvent(event_id)
+            status, result = row
+            if status not in REVIEWABLE:
+                raise NotReviewable(f"event is {status}")
+            if action == "resolve" and status != "needs_human":
+                raise NotReviewable(f"only an event waiting for a person can be resolved, this one is {status}")
+            reviews = self._reviews(event_id)
+            current = effective_decision(json.loads(result), reviews)
+            if action == "correct" and category == current["category"]:
+                raise InvalidReview(f"category is already {category}")
+            after = category if action == "correct" else current["category"]
+            self._db.execute(
+                "INSERT INTO reviews (event_id, version, at, reviewer, action, category_before, category_after, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, current["version"] + 1, now, reviewer.strip(), action, current["category"], after, reason.strip()),
+            )
+            if action == "resolve":
+                self._db.execute("UPDATE events SET status = 'resolved' WHERE event_id = ?", (event_id,))
+            self._audit(
+                event_id,
+                now,
+                "reviewed",
+                json.dumps({"action": action, "reviewer": reviewer.strip(), "reason": reason.strip(), "from": current["category"], "to": after}, sort_keys=True),
+            )
+            self._db.commit()
+            return self._get_locked(event_id)
 
     def count(self) -> int:
         with self._lock:

@@ -144,9 +144,10 @@ def test_a_slow_worker_cannot_overwrite_the_worker_that_took_over(store, clock):
     second = store.claim(clock(), 30, 3)
     assert second.event_id == first.event_id and second.attempt == 2
     with pytest.raises(LeaseLost):
-        store.complete(event_id, first.attempt, "done", {"category": "other"}, clock())
-    store.complete(event_id, second.attempt, "done", {"category": "shipping"}, clock())
-    assert store.get(event_id)["result"] == {"category": "shipping"}
+        store.complete(event_id, first.attempt, "done", {"category": "other", "needs_human": False, "reasons": []}, clock())
+    winner = {"category": "shipping", "needs_human": False, "reasons": []}
+    store.complete(event_id, second.attempt, "done", winner, clock())
+    assert store.get(event_id)["result"] == winner
 
 
 def test_complete_and_fail_reject_an_event_not_being_processed(store, clock):
