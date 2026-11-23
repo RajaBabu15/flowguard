@@ -15,4 +15,11 @@ def create_app(store: EventStore | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="idempotency key was already used with a different body")
         return {"event_id": accepted.event_id, "replayed": accepted.replayed}
 
+    @app.get("/events/{event_id}")
+    def get_event(event_id: str):
+        event = store.get(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="no such event")
+        return event
+
     return app

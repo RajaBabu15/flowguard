@@ -1,6 +1,6 @@
 # flowguard
 
-A backend for AI workflows that must be safe to retry and easy to audit. Today it has two pieces: an event endpoint that accepts each event once, however many times the client retries, and an eval harness with a plain keyword baseline to beat.
+A backend for AI workflows that must be safe to retry and easy to audit. Today it has three pieces: an event endpoint that accepts each event once however often the client retries, a worker that processes each event once with retries and a dead-letter state, and an eval harness with a plain keyword baseline to beat.
 
 ## What works now
 
@@ -12,6 +12,20 @@ A backend for AI workflows that must be safe to retry and easy to audit. Today i
 - Key order inside the JSON body does not change identity.
 
 Events are stored in SQLite with the key as primary key, behind a lock, so concurrent retries create one row (tested with 16 threads).
+
+## Worker
+
+`Worker(store, system).run_once()` claims the oldest ready event, asks the system for a `Decision`, and records it. `GET /events/{id}` shows the status, attempts, result and the audit trail.
+
+States: `pending`, `processing`, then `done`, `needs_human` (the system asked for a person) or `dead`.
+
+- A claim is a lease. If the worker dies, the lease runs out and the event is claimed again; after the last allowed attempt it becomes `dead` instead of looping.
+- `TransientError` from a system means retry later, with doubling backoff. Any other exception is a bug: it is not caught, the event is not lost, and it ends up `dead` after the attempts run out.
+- A worker that finishes after its lease was taken over gets `LeaseLost` and cannot overwrite the new owner's result.
+- A payload with no `text` goes straight to `dead`; retrying cannot fix it.
+- Every transition is appended to an audit log.
+
+Tests cover each rule, including six workers draining 40 events with each decided exactly once. The only system wired in so far is the keyword baseline, used through the evals; no model is called.
 
 ## Evals
 
@@ -47,7 +61,9 @@ python3 -m venv .venv
 ## Limits
 
 - Storage is in memory by default; pass a file path to `EventStore` to keep events.
-- Nothing processes the stored events yet. There is no model call, retrieval, tool use or approval step in this repository so far.
+- There is no model call, retrieval, tool use or approval step yet, and no command that starts a worker loop: the worker is a class used from code and tests.
+- `needs_human` events are parked; nothing lets a person resolve them yet.
+- The database schema changed with the worker; delete any `.db` file made by the first commit.
 - 40 cases is small: one wrong case moves accuracy by about 3 points. It is a harness to build on, not a benchmark.
 - The baseline is deterministic, so stability is 1.0 by construction; that metric only becomes informative with a model.
 - One shared SQLite connection behind a lock is fine for one process, not for several.
