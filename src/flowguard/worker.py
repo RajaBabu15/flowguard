@@ -7,12 +7,11 @@ so a crashing system can never lose an event or run it forever.
 import time
 from typing import Callable
 
+from flowguard.errors import TransientError
 from flowguard.evals import System
 from flowguard.store import EventStore
 
-
-class TransientError(Exception):
-    """Raised by a system for a failure worth retrying, such as a timeout or a rate limit."""
+__all__ = ["TransientError", "Worker"]
 
 
 class Worker:

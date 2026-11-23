@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from flowguard.errors import TransientError
+
 CATEGORIES = ("billing", "refund", "shipping", "technical", "account", "other")
 GATED = ("category_accuracy", "escalation_recall", "escalation_precision", "stability")
 
@@ -61,6 +63,7 @@ class Report:
     missed_escalations: list[str] = field(default_factory=list)
     wrong_categories: list[str] = field(default_factory=list)
     wrong_disputed: list[str] = field(default_factory=list)
+    failed_calls: list[str] = field(default_factory=list)
     by_tag: dict[str, tuple[int, float]] = field(default_factory=dict)
 
 
@@ -94,14 +97,25 @@ def load_cases(path: Path) -> list[Case]:
 def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
     if repeats < 1:
         raise ValueError("repeats must be at least 1")
-    runs = [[system.decide(c.text) for c in cases] for _ in range(repeats)]
+    failed: set[str] = set()
+
+    def decide(case: Case) -> Decision | None:
+        # A call that fails with a retryable error counts as a wrong answer here: in production it would be
+        # retried, but a system that keeps failing on a ticket has not handled it.
+        try:
+            return system.decide(case.text)
+        except TransientError:
+            failed.add(case.id)
+            return None
+
+    runs = [[decide(c) for c in cases] for _ in range(repeats)]
 
     correct = counted = d_correct = d_counted = tp = fp = fn = 0
     wrong_categories, wrong_disputed, missed = set(), set(), set()
     tag_hits: dict[str, list[int]] = defaultdict(list)
     for run in runs:
         for case, got in zip(cases, run):
-            ok = got.category == case.category
+            ok = got is not None and got.category == case.category
             if "disputed" in case.tags:
                 d_counted += 1
                 d_correct += ok
@@ -114,12 +128,13 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
                     wrong_categories.add(case.id)
             for tag in case.tags:
                 tag_hits[tag].append(int(ok))
-            if case.needs_human and got.needs_human:
+            flagged = got is not None and got.needs_human
+            if case.needs_human and flagged:
                 tp += 1
-            elif case.needs_human and not got.needs_human:
+            elif case.needs_human:
                 fn += 1
                 missed.add(case.id)
-            elif got.needs_human:
+            elif flagged:
                 fp += 1
 
     if counted == 0:
@@ -139,6 +154,7 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
         missed_escalations=sorted(missed),
         wrong_categories=sorted(wrong_categories),
         wrong_disputed=sorted(wrong_disputed),
+        failed_calls=sorted(failed),
         by_tag={t: (len(h), sum(h) / len(h)) for t, h in sorted(tag_hits.items())},
     )
 
@@ -163,6 +179,7 @@ def format_report(report: Report) -> str:
         f"escalation precision {report.escalation_precision:.3f}",
         f"stability            {report.stability:.3f}",
         f"missed escalations   {', '.join(report.missed_escalations) or 'none'}",
+        f"failed calls         {', '.join(report.failed_calls) or 'none'}",
         f"wrong categories     {', '.join(report.wrong_categories) or 'none'}",
         "disputed accuracy    "
         + ("n/a" if report.disputed_accuracy is None else f"{report.disputed_accuracy:.3f} (wrong: {', '.join(report.wrong_disputed) or 'none'})"),
@@ -173,16 +190,21 @@ def format_report(report: Report) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from flowguard.llm import LLMSystem, OllamaProvider
     from flowguard.triage import KeywordBaseline
 
     root = Path(__file__).resolve().parents[2]
-    parser = argparse.ArgumentParser(description="Run the eval cases against the keyword baseline.")
+    parser = argparse.ArgumentParser(description="Run the eval cases against a system and gate on the thresholds.")
+    parser.add_argument("--system", choices=("keyword", "ollama"), default="keyword")
+    parser.add_argument("--model", default="qwen2.5:7b", help="Ollama model name, used with --system ollama")
     parser.add_argument("--cases", type=Path, default=root / "evals" / "cases.jsonl")
     parser.add_argument("--thresholds", type=Path, default=root / "evals" / "thresholds.json")
     parser.add_argument("--repeats", type=int, default=1)
     args = parser.parse_args(argv)
 
-    report = evaluate(KeywordBaseline(), load_cases(args.cases), args.repeats)
+    system = KeywordBaseline() if args.system == "keyword" else LLMSystem(OllamaProvider(args.model))
+    report = evaluate(system, load_cases(args.cases), args.repeats)
+    print(f"system {args.system}" + (f" {args.model}" if args.system == "ollama" else ""))
     print(format_report(report))
     failures = check(report, json.loads(args.thresholds.read_text()))
     for message in failures:

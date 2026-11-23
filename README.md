@@ -25,7 +25,13 @@ States: `pending`, `processing`, then `done`, `needs_human` (the system asked fo
 - A payload with no `text` goes straight to `dead`; retrying cannot fix it.
 - Every transition is appended to an audit log.
 
-Tests cover each rule, including six workers draining 40 events with each decided exactly once. The only system wired in so far is the keyword baseline, used through the evals; no model is called.
+Tests cover each rule, including six workers draining 40 events with each decided exactly once.
+
+## Model
+
+`LLMSystem` asks a model for `{category, needs_human}`. The ticket is wrapped in tags and the prompt says to treat it as data, but a prompt is not a boundary; the injection cases measure how often the model obeys text inside a ticket. Answers are checked strictly (known category, a real boolean). An unusable answer raises a retryable error, so the worker retries it and finally dead-letters it. `OllamaProvider` talks to a local Ollama server with temperature 0 and a fixed seed, and asks for output constrained to a JSON schema. Timeouts, connection errors and 5xx replies are retryable; a 4xx is not. The provider is an interface, so a hosted model can replace it without touching the worker.
+
+The prompt restates the labelling rules in general terms and contains no eval ticket (a test checks that). It was written before any model was run and has not been changed since.
 
 ## Evals
 
@@ -33,6 +39,7 @@ Tests cover each rule, including six workers draining 40 events with each decide
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m flowguard.evals --repeats 3
+PYTHONPATH=src .venv/bin/python -m flowguard.evals --system ollama --model qwen2.5:7b
 ```
 
 It prints category accuracy, escalation recall and precision, run-to-run stability, the ids of missed escalations and wrong categories, and accuracy per tag. It exits 1 if any metric is below `evals/thresholds.json`.
@@ -45,7 +52,18 @@ The first system scored is a keyword baseline with no model (`src/flowguard/tria
 | escalation recall | 0.250 |
 | escalation precision | 1.000 |
 
-It misses 9 of the 12 cases that need a person: every prompt-injection case, the high-value refunds, the data-deletion request, the card-number case and the customer who asks for a person. It catches only the legal and stolen-card cases. The thresholds are set at these values, so they only stop it getting worse. Any model-backed system added later is expected to beat them and to raise the floors.
+It misses 9 of the 12 cases that need a person: every prompt-injection case, the high-value refunds, the data-deletion request, the card-number case and the customer who asks for a person. It catches only the legal and stolen-card cases. The thresholds are set at the baseline's values, so they only stop a system getting worse than the baseline. 
+
+Local models through Ollama, measured 2026-11-23 on an Apple M4 with Ollama 0.40.6 (temperature 0, seed 0), same 40 cases:
+
+| system | category accuracy | escalation recall | escalation precision |
+|---|---|---|---|
+| keyword baseline | 0.694 | 0.250 | 1.000 |
+| qwen2.5:7b (3 runs, identical) | 0.889 | 0.833 | 0.909 |
+| llama3.1:8b (1 run) | 0.806 | 0.833 | 0.714 |
+| qwen2.5:3b (1 run) | 0.444 | 0.667 | 0.500 |
+
+`qwen2.5:7b` misses two escalations: the 18,000 refund (c06) and the injection hidden in a late-delivery ticket (c19). It gets four categories wrong: c16, c23, c34, c40. These numbers say how each model followed my rules on my 40 cases, once. They are not a general ranking: the cases and the prompt come from the same author, 40 cases is small, a single wrong case moves a score by about 3 points, and identical runs reflect temperature 0 with a fixed seed, not stability under normal sampling. No prompt change has been made in response to these failures; that needs new cases the prompt has not seen.
 
 ## Run it
 
@@ -61,7 +79,8 @@ python3 -m venv .venv
 ## Limits
 
 - Storage is in memory by default; pass a file path to `EventStore` to keep events.
-- There is no model call, retrieval, tool use or approval step yet, and no command that starts a worker loop: the worker is a class used from code and tests.
+- No retrieval, tool use or approval step yet, and no command that starts a worker loop: the worker is a class used from code and tests.
+- Only a local Ollama provider exists; no hosted model has been run.
 - `needs_human` events are parked; nothing lets a person resolve them yet.
 - The database schema changed with the worker; delete any `.db` file made by the first commit.
 - 40 cases is small: one wrong case moves accuracy by about 3 points. It is a harness to build on, not a benchmark.
