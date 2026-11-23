@@ -15,7 +15,7 @@ Events are stored in SQLite with the key as primary key, behind a lock, so concu
 
 ## Evals
 
-`evals/cases.jsonl` holds 32 hand-written support tickets: typos, two issues in one message, account security, legal threats, prompt injection, non-English text, vague text. Each has a `category` and a `needs_human` label. The labelling rules are in the docstring of `src/flowguard/evals.py`. I wrote the cases and labels myself, so they carry my judgement and nobody else has reviewed them.
+`evals/cases.jsonl` holds 40 hand-written support tickets: typos, two issues in one message, account security, a card number typed into the ticket, legal threats, prompt injection, abuse, repeats, a long pasted thread, mixed and non-English text, vague text, a customer asking for a person. Each has a `category` and a `needs_human` label. The labelling rules are in the docstring of `src/flowguard/evals.py`; a refund above 5,000 needs a person. Four cases are tagged `disputed` because a second reader could label the category differently; they are left out of the headline accuracy and reported on their own line. I wrote the cases and labels myself, so they carry my judgement and nobody else has reviewed them.
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m flowguard.evals --repeats 3
@@ -27,11 +27,11 @@ The first system scored is a keyword baseline with no model (`src/flowguard/tria
 
 | metric | baseline |
 |---|---|
-| category accuracy | 0.688 |
+| category accuracy (36 undisputed cases) | 0.694 |
 | escalation recall | 0.250 |
 | escalation precision | 1.000 |
 
-It misses 9 of 12 cases that need a person, including every prompt-injection case but none of the legal ones. The thresholds are set at these values, so they only stop it getting worse. Any model-backed system added later is expected to beat them and to raise the floors.
+It misses 9 of the 12 cases that need a person: every prompt-injection case, the high-value refunds, the data-deletion request, the card-number case and the customer who asks for a person. It catches only the legal and stolen-card cases. The thresholds are set at these values, so they only stop it getting worse. Any model-backed system added later is expected to beat them and to raise the floors.
 
 ## Run it
 
@@ -48,7 +48,7 @@ python3 -m venv .venv
 
 - Storage is in memory by default; pass a file path to `EventStore` to keep events.
 - Nothing processes the stored events yet. There is no model call, retrieval, tool use or approval step in this repository so far.
-- 32 cases is small: one wrong case moves accuracy by 3 points. It is a harness to build on, not a benchmark.
+- 40 cases is small: one wrong case moves accuracy by about 3 points. It is a harness to build on, not a benchmark.
 - The baseline is deterministic, so stability is 1.0 by construction; that metric only becomes informative with a model.
 - One shared SQLite connection behind a lock is fine for one process, not for several.
 - Tests run on Python 3.15 only; the declared minimum, 3.12, has not been tested.

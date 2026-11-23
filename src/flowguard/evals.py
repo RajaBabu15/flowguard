@@ -1,9 +1,18 @@
 """Eval harness: load labelled cases, run a system over them, score, and gate on thresholds.
 
 Labels follow two rules written by hand. `category` is the issue named first in the ticket.
-`needs_human` is true when acting without a person would be risky: security or privacy,
-legal or safety, a high-value refund, more than one issue, or text trying to instruct the system.
+`needs_human` is true when acting without a person would be risky:
+  - account security or privacy requests, or personal data such as a card number typed into the ticket;
+  - legal threats or physical safety;
+  - a refund above 5,000;
+  - text that tries to instruct the system;
+  - the customer asks for a person.
+Having two issues is not enough on its own; one of them has to be risky by the list above.
 Escalation recall is the number that matters most, because a missed escalation is the costly error.
+
+Cases tagged `disputed` have a category a second reader could reasonably label differently. They are
+left out of the headline category accuracy and reported on their own, so one person's taste cannot
+move the score. They still count for escalation.
 """
 import argparse
 import json
@@ -48,8 +57,10 @@ class Report:
     escalation_recall: float
     escalation_precision: float
     stability: float
+    disputed_accuracy: float | None = None
     missed_escalations: list[str] = field(default_factory=list)
     wrong_categories: list[str] = field(default_factory=list)
+    wrong_disputed: list[str] = field(default_factory=list)
     by_tag: dict[str, tuple[int, float]] = field(default_factory=dict)
 
 
@@ -85,15 +96,22 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
         raise ValueError("repeats must be at least 1")
     runs = [[system.decide(c.text) for c in cases] for _ in range(repeats)]
 
-    correct = tp = fp = fn = 0
-    wrong_categories, missed = set(), set()
+    correct = counted = d_correct = d_counted = tp = fp = fn = 0
+    wrong_categories, wrong_disputed, missed = set(), set(), set()
     tag_hits: dict[str, list[int]] = defaultdict(list)
     for run in runs:
         for case, got in zip(cases, run):
             ok = got.category == case.category
-            correct += ok
-            if not ok:
-                wrong_categories.add(case.id)
+            if "disputed" in case.tags:
+                d_counted += 1
+                d_correct += ok
+                if not ok:
+                    wrong_disputed.add(case.id)
+            else:
+                counted += 1
+                correct += ok
+                if not ok:
+                    wrong_categories.add(case.id)
             for tag in case.tags:
                 tag_hits[tag].append(int(ok))
             if case.needs_human and got.needs_human:
@@ -104,7 +122,8 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
             elif got.needs_human:
                 fp += 1
 
-    total = len(cases) * repeats
+    if counted == 0:
+        raise ValueError("every case is disputed; the headline accuracy would be empty")
     # With no predicted escalations precision is undefined; 0.0 keeps the gate conservative.
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 1.0
@@ -112,12 +131,14 @@ def evaluate(system: System, cases: list[Case], repeats: int = 1) -> Report:
     return Report(
         cases=len(cases),
         repeats=repeats,
-        category_accuracy=correct / total,
+        category_accuracy=correct / counted,
+        disputed_accuracy=d_correct / d_counted if d_counted else None,
         escalation_recall=recall,
         escalation_precision=precision,
         stability=stable / len(cases),
         missed_escalations=sorted(missed),
         wrong_categories=sorted(wrong_categories),
+        wrong_disputed=sorted(wrong_disputed),
         by_tag={t: (len(h), sum(h) / len(h)) for t, h in sorted(tag_hits.items())},
     )
 
@@ -143,6 +164,8 @@ def format_report(report: Report) -> str:
         f"stability            {report.stability:.3f}",
         f"missed escalations   {', '.join(report.missed_escalations) or 'none'}",
         f"wrong categories     {', '.join(report.wrong_categories) or 'none'}",
+        "disputed accuracy    "
+        + ("n/a" if report.disputed_accuracy is None else f"{report.disputed_accuracy:.3f} (wrong: {', '.join(report.wrong_disputed) or 'none'})"),
         "category accuracy by tag:",
     ]
     lines += [f"  {tag:<16} n={n:<3} {acc:.3f}" for tag, (n, acc) in report.by_tag.items()]
