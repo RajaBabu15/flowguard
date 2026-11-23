@@ -1,0 +1,25 @@
+[project]
+name = "flowguard"
+version = "0.1.0"
+description = "A backend that takes events in, lets a model act through scoped tools, and keeps every step safe to retry and easy to audit."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.165.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx==0.28.1",
+    "pytest==9.2.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
